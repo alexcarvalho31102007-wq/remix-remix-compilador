@@ -17,22 +17,34 @@ import com.example.data.model.GitHubConfig
 import com.example.data.model.OverallBuildStatus
 import com.example.data.model.ProjectZipMetadata
 import com.example.data.model.StageStatus
-import com.example.data.repository.BuildProgressEvent
+import com.example.data.repository.BuildStateManager
 import com.example.data.repository.CompilerRepository
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
+import com.example.service.BuildForegroundService
+import com.example.util.ApkDownloadHelper
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
 import java.util.UUID
 
+enum class CompilerTab {
+    COMPILER,
+    HISTORY
+}
+
+enum class HistoryFilter {
+    ALL,
+    RUNNING,
+    SUCCESS,
+    FAILED
+}
+
 data class MainUiState(
+    val selectedTab: CompilerTab = CompilerTab.COMPILER,
+    val historyFilter: HistoryFilter = HistoryFilter.ALL,
     val githubConfig: GitHubConfig = GitHubConfig(),
     val selectedZip: ProjectZipMetadata? = null,
     val stages: List<BuildStageItem> = emptyList(),
@@ -40,17 +52,18 @@ data class MainUiState(
     val overallStatus: OverallBuildStatus = OverallBuildStatus.IDLE,
     val allLogs: String = "",
     val apkFile: File? = null,
+    val activeBuildId: String? = null,
     val errorMessage: String? = null,
     val isBuilding: Boolean = false,
     val timerSeconds: Int = 0,
     val showSettingsSheet: Boolean = false,
-    val showWorkflowGuide: Boolean = false,
     val showLogsCopiedFeedback: Boolean = false,
     val isVerifyingConfig: Boolean = false,
     val isAutoSettingUp: Boolean = false,
     val autoSetupProgressMessage: String? = null,
     val configVerificationMessage: String? = null,
     val buildHistory: List<BuildHistoryRecord> = emptyList(),
+    val selectedRecordForLogs: BuildHistoryRecord? = null,
     val userSnackbarMessage: String? = null
 )
 
@@ -60,11 +73,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
-    private var compilationJob: Job? = null
-    private var timerJob: Job? = null
-
     init {
         loadInitialConfig()
+        refreshHistory()
+        observeBuildStateManager()
     }
 
     private fun loadInitialConfig() {
@@ -74,6 +86,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (config.token.isNotBlank() && !config.isConfigured) {
             autoSetupToken(config.token)
         }
+    }
+
+    private fun observeBuildStateManager() {
+        viewModelScope.launch {
+            BuildStateManager.state.collect { state ->
+                _uiState.update { current ->
+                    current.copy(
+                        isBuilding = state.isBuilding,
+                        overallStatus = state.overallStatus,
+                        stages = state.stages,
+                        currentStageIndex = state.currentStageIndex,
+                        timerSeconds = state.timerSeconds,
+                        allLogs = state.logs,
+                        errorMessage = state.errorMessage,
+                        apkFile = state.apkFile,
+                        activeBuildId = state.buildId
+                    )
+                }
+                if (!state.isBuilding && (state.overallStatus == OverallBuildStatus.SUCCESS || state.overallStatus == OverallBuildStatus.FAILED)) {
+                    refreshHistory()
+                }
+            }
+        }
+    }
+
+    fun selectTab(tab: CompilerTab) {
+        _uiState.update { it.copy(selectedTab = tab) }
+        if (tab == CompilerTab.HISTORY) {
+            refreshHistory()
+        }
+    }
+
+    fun setHistoryFilter(filter: HistoryFilter) {
+        _uiState.update { it.copy(historyFilter = filter) }
+    }
+
+    fun refreshHistory() {
+        val records = repository.getHistoryRecords()
+        _uiState.update { it.copy(buildHistory = records) }
     }
 
     fun onZipSelected(uri: Uri, autoStart: Boolean = true) {
@@ -103,149 +154,72 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun loadSampleProject() {
-        viewModelScope.launch {
-            val result = repository.createSampleProjectZip()
-            result.onSuccess { meta ->
-                _uiState.update {
-                    it.copy(
-                        selectedZip = meta,
-                        overallStatus = OverallBuildStatus.IDLE,
-                        stages = emptyList(),
-                        apkFile = null,
-                        errorMessage = null,
-                        allLogs = ""
-                    )
-                }
-                startCompilation()
-            }.onFailure { err ->
-                _uiState.update {
-                    it.copy(userSnackbarMessage = "Erro ao gerar projeto de teste: ${err.message}")
-                }
-            }
+    fun startCompilation() {
+        val zipMeta = _uiState.value.selectedZip
+        if (zipMeta == null) {
+            _uiState.update { it.copy(userSnackbarMessage = "Selecione um arquivo ZIP do projeto primeiro.") }
+            return
         }
-    }
 
-    fun startCompilation(simulateFailure: Boolean = false) {
-        val zipMeta = _uiState.value.selectedZip ?: return
         if (_uiState.value.isBuilding) return
 
-        compilationJob?.cancel()
-        timerJob?.cancel()
+        val config = _uiState.value.githubConfig
+        if (!config.isConfigured) {
+            _uiState.update {
+                it.copy(
+                    showSettingsSheet = true,
+                    userSnackbarMessage = "Configure seu Token do GitHub para compilar o APK Release."
+                )
+            }
+            return
+        }
+
+        val buildId = "BUILD-${UUID.randomUUID().toString().take(6).uppercase(Locale.ROOT)}"
+        val zipPath = zipMeta.localCachedPath ?: ""
+
+        // Inicia em segundo plano via ForegroundService (continua mesmo se fechar o app)
+        BuildForegroundService.startBuild(
+            context = getApplication(),
+            buildId = buildId,
+            projectName = zipMeta.fileName,
+            zipPath = zipPath
+        )
 
         _uiState.update {
             it.copy(
                 isBuilding = true,
                 overallStatus = OverallBuildStatus.RUNNING,
+                activeBuildId = buildId,
                 apkFile = null,
                 errorMessage = null,
                 allLogs = "",
                 timerSeconds = 0
             )
         }
-
-        // Start timer
-        timerJob = viewModelScope.launch {
-            while (true) {
-                delay(1000)
-                _uiState.update { it.copy(timerSeconds = it.timerSeconds + 1) }
-            }
-        }
-
-        compilationJob = viewModelScope.launch {
-            val config = _uiState.value.githubConfig
-            val flow = if (simulateFailure) {
-                repository.executeSimulatedFailure(zipMeta)
-            } else {
-                repository.executeCompilationPipeline(zipMeta, config)
-            }
-
-            flow.collect { event ->
-                when (event) {
-                    is BuildProgressEvent.StagesUpdated -> {
-                        _uiState.update {
-                            it.copy(
-                                stages = event.stages,
-                                currentStageIndex = event.currentStageIndex,
-                                overallStatus = event.overallStatus
-                            )
-                        }
-                    }
-                    is BuildProgressEvent.BuildSuccess -> {
-                        timerJob?.cancel()
-                        val durationText = formatSeconds(_uiState.value.timerSeconds)
-                        val historyItem = BuildHistoryRecord(
-                            id = UUID.randomUUID().toString(),
-                            projectName = zipMeta.fileName,
-                            dateFormatted = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault()).format(Date()),
-                            status = OverallBuildStatus.SUCCESS,
-                            apkPath = event.apkFile.absolutePath,
-                            logs = event.totalLogs,
-                            durationFormatted = durationText
-                        )
-                        _uiState.update {
-                            it.copy(
-                                isBuilding = false,
-                                overallStatus = OverallBuildStatus.SUCCESS,
-                                apkFile = event.apkFile,
-                                stages = event.stages,
-                                allLogs = event.totalLogs,
-                                buildHistory = listOf(historyItem) + it.buildHistory,
-                                userSnackbarMessage = "Compilação concluída com sucesso!"
-                            )
-                        }
-                    }
-                    is BuildProgressEvent.BuildFailure -> {
-                        timerJob?.cancel()
-                        val durationText = formatSeconds(_uiState.value.timerSeconds)
-                        val historyItem = BuildHistoryRecord(
-                            id = UUID.randomUUID().toString(),
-                            projectName = zipMeta.fileName,
-                            dateFormatted = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault()).format(Date()),
-                            status = OverallBuildStatus.FAILED,
-                            apkPath = null,
-                            logs = event.totalLogs,
-                            durationFormatted = durationText
-                        )
-                        _uiState.update {
-                            it.copy(
-                                isBuilding = false,
-                                overallStatus = OverallBuildStatus.FAILED,
-                                errorMessage = event.errorMessage,
-                                stages = event.stages,
-                                allLogs = event.totalLogs,
-                                buildHistory = listOf(historyItem) + it.buildHistory,
-                                userSnackbarMessage = "Compilação falhou."
-                            )
-                        }
-                    }
-                }
-            }
-        }
     }
 
     fun cancelCompilation() {
-        compilationJob?.cancel()
-        timerJob?.cancel()
+        BuildForegroundService.stopBuild(getApplication())
+        BuildStateManager.cancelBuild()
         _uiState.update {
             it.copy(
                 isBuilding = false,
                 overallStatus = OverallBuildStatus.IDLE,
-                stages = emptyList(),
                 userSnackbarMessage = "Compilação cancelada."
             )
         }
+        refreshHistory()
     }
 
     fun resetForNewBuild() {
-        compilationJob?.cancel()
-        timerJob?.cancel()
+        BuildStateManager.reset()
         _uiState.update {
             it.copy(
                 selectedZip = null,
                 overallStatus = OverallBuildStatus.IDLE,
                 stages = emptyList(),
                 apkFile = null,
+                activeBuildId = null,
                 errorMessage = null,
                 allLogs = "",
                 timerSeconds = 0
@@ -253,8 +227,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun copyLogsToClipboard(context: Context) {
-        val logs = _uiState.value.allLogs
+    fun deleteHistoryRecord(record: BuildHistoryRecord) {
+        if (_uiState.value.isBuilding && _uiState.value.activeBuildId == record.id) {
+            _uiState.update {
+                it.copy(userSnackbarMessage = "Esta compilação está em andamento e não pode ser excluída agora.")
+            }
+            return
+        }
+
+        val deleted = repository.deleteHistoryRecord(record.id)
+        if (deleted) {
+            refreshHistory()
+            _uiState.update { it.copy(userSnackbarMessage = "Registro de compilação excluído.") }
+        }
+    }
+
+    fun openRecordLogs(record: BuildHistoryRecord) {
+        _uiState.update { it.copy(selectedRecordForLogs = record) }
+    }
+
+    fun closeRecordLogs() {
+        _uiState.update { it.copy(selectedRecordForLogs = null) }
+    }
+
+    fun copyLogsToClipboard(context: Context, customLogs: String? = null) {
+        val logs = customLogs ?: _uiState.value.allLogs
         if (logs.isBlank()) {
             _uiState.update { it.copy(userSnackbarMessage = "Nenhum log disponível.") }
             return
@@ -272,19 +269,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         viewModelScope.launch {
-            delay(3000)
+            kotlinx.coroutines.delay(2500)
             _uiState.update { it.copy(showLogsCopiedFeedback = false) }
         }
     }
 
-    fun installApk(context: Context) {
-        val apk = _uiState.value.apkFile
+    fun saveApkToDownloads(context: Context, specificApkFile: File? = null, projectName: String? = null) {
+        val apk = specificApkFile ?: _uiState.value.apkFile
         if (apk == null || !apk.exists()) {
-            _uiState.update { it.copy(userSnackbarMessage = "Arquivo APK não encontrado.") }
+            _uiState.update { it.copy(userSnackbarMessage = "Arquivo APK Release não encontrado.") }
             return
         }
 
-        // Check canRequestPackageInstalls on Android 8.0+
+        val name = projectName ?: apk.name
+        val result = ApkDownloadHelper.saveApkToPublicDownloads(context, apk, name)
+        result.onSuccess { msg ->
+            _uiState.update { it.copy(userSnackbarMessage = msg) }
+        }.onFailure { err ->
+            _uiState.update { it.copy(userSnackbarMessage = "Erro ao salvar APK: ${err.message}") }
+        }
+    }
+
+    fun installApk(context: Context, specificApkFile: File? = null) {
+        val apk = specificApkFile ?: _uiState.value.apkFile
+        if (apk == null || !apk.exists()) {
+            _uiState.update { it.copy(userSnackbarMessage = "Arquivo APK Release não encontrado.") }
+            return
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             if (!context.packageManager.canRequestPackageInstalls()) {
                 val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
@@ -316,8 +328,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun shareApk(context: Context) {
-        val apk = _uiState.value.apkFile ?: return
+    fun shareApk(context: Context, specificApkFile: File? = null) {
+        val apk = specificApkFile ?: _uiState.value.apkFile ?: return
         try {
             val authority = "${context.packageName}.fileprovider"
             val apkUri = FileProvider.getUriForFile(context, authority, apk)
@@ -326,7 +338,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 putExtra(Intent.EXTRA_STREAM, apkUri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            context.startActivity(Intent.createChooser(shareIntent, "Compartilhar Aplicativo Compilado"))
+            context.startActivity(Intent.createChooser(shareIntent, "Compartilhar APK Release"))
         } catch (e: Exception) {
             _uiState.update { it.copy(userSnackbarMessage = "Erro ao compartilhar: ${e.message}") }
         }
@@ -336,7 +348,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(
                 isAutoSettingUp = true,
-                autoSetupProgressMessage = "Iniciando configuração automática...",
+                autoSetupProgressMessage = "Iniciando configuração no GitHub...",
                 configVerificationMessage = null
             )
         }
@@ -353,7 +365,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         autoSetupProgressMessage = null,
                         githubConfig = config,
                         showSettingsSheet = false,
-                        userSnackbarMessage = "GitHub configurado com sucesso! Repositório e workflow criados automaticamente."
+                        userSnackbarMessage = "GitHub configurado com sucesso para compilações Release!"
                     )
                 }
             }.onFailure { err ->
@@ -379,39 +391,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun saveGitHubConfig(config: GitHubConfig) {
-        repository.saveGitHubConfig(config)
-        _uiState.update {
-            it.copy(
-                githubConfig = config,
-                showSettingsSheet = false,
-                userSnackbarMessage = "Configurações do GitHub salvas com sucesso!"
-            )
-        }
-    }
-
-    fun verifyConfig(config: GitHubConfig) {
-        _uiState.update { it.copy(isVerifyingConfig = true, configVerificationMessage = null) }
-        viewModelScope.launch {
-            val result = repository.verifyGitHubConnection(config)
-            result.onSuccess { msg ->
-                _uiState.update {
-                    it.copy(
-                        isVerifyingConfig = false,
-                        configVerificationMessage = "Conexão bem-sucedida! $msg"
-                    )
-                }
-            }.onFailure { err ->
-                _uiState.update {
-                    it.copy(
-                        isVerifyingConfig = false,
-                        configVerificationMessage = "Falha na conexão: ${err.message}"
-                    )
-                }
-            }
-        }
-    }
-
     fun openSettings() {
         _uiState.update { it.copy(showSettingsSheet = true, configVerificationMessage = null) }
     }
@@ -420,21 +399,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(showSettingsSheet = false) }
     }
 
-    fun openWorkflowGuide() {
-        _uiState.update { it.copy(showWorkflowGuide = true) }
-    }
-
-    fun closeWorkflowGuide() {
-        _uiState.update { it.copy(showWorkflowGuide = false) }
-    }
-
     fun dismissSnackbar() {
         _uiState.update { it.copy(userSnackbarMessage = null) }
-    }
-
-    private fun formatSeconds(seconds: Int): String {
-        val mins = seconds / 60
-        val secs = seconds % 60
-        return String.format(Locale.getDefault(), "%02d:%02d", mins, secs)
     }
 }

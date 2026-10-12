@@ -1,5 +1,8 @@
 package com.example.data.model
 
+import com.squareup.moshi.Json
+import com.squareup.moshi.JsonClass
+
 enum class StageStatus {
     PENDING,
     IN_PROGRESS,
@@ -46,12 +49,16 @@ data class GitHubConfig(
         get() = if (owner.isNotBlank() && repo.isNotBlank()) "$owner/$repo" else ""
 }
 
+@JsonClass(generateAdapter = true)
 data class BuildHistoryRecord(
-    val id: String,
-    val projectName: String,
-    val dateFormatted: String,
-    val status: OverallBuildStatus,
-    val apkPath: String? = null,
-    val logs: String = "",
-    val durationFormatted: String = ""
+    @Json(name = "id") val id: String,
+    @Json(name = "projectName") val projectName: String,
+    @Json(name = "dateFormatted") val dateFormatted: String,
+    @Json(name = "status") val status: OverallBuildStatus,
+    @Json(name = "apkPath") val apkPath: String? = null,
+    @Json(name = "logs") val logs: String = "",
+    @Json(name = "durationFormatted") val durationFormatted: String = "",
+    @Json(name = "apkSizeBytes") val apkSizeBytes: Long = 0L,
+    @Json(name = "githubRunId") val githubRunId: Long? = null,
+    @Json(name = "errorMessage") val errorMessage: String? = null
 )
